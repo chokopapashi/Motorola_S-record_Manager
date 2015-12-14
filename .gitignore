@@ -1,0 +1,12 @@
+
+*~
+*.swp
+.svn
+*.bat
+*.lnk
+*.log
+target
+
+out.bin
+out.txt
+
