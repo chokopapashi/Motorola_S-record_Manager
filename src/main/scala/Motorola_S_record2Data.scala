@@ -1,12 +1,22 @@
 
 import java.io.BufferedOutputStream
+import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FileWriter
 import java.io.IOException
 import java.io.OutputStream
+import java.io.Writer
 
+import scala.annotation.tailrec
+import scala.concurrent._
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration.Duration
 import scala.io.Source
+import scala.reflect.ClassTag
 import scala.util.control.Exception._
+import scala.util.Success
+import scala.util.Failure
 
 import org.hirosezouen.hzutil.HZLog._
 import org.hirosezouen.hzutil.HZIO._
@@ -14,30 +24,61 @@ import org.hirosezouen.hzutil.HZIO._
 object Motorola_S_record2Data {
     implicit val logger = getLogger(this.getClass.getName)
 
+    type FA[A] = Future[Array[A]]
+    type LFA[A] = List[FA[A]]
+    type LA[A] = List[Array[A]]
+
     var executed_record_count = 0
 
-    def parseAndOut(seq: Seq[String], outFunc: (String) => Unit) = {
-        val record_r = "^S3(.*)".r
-        for(rec <- seq) {
-            rec match {
-                case record_r(n1) => catching(classOf[NumberFormatException]) opt {
-                    java.lang.Long.parseLong(n1.take(2), 16)
+    def parseRecord[A:ClassTag](srecStr: String, produce: (String) => A): FA[A] = {
+        val srec_r = "^S3(.*)".r
+        Future {
+            srecStr match {
+                case srec_r(srec_d) => catching(classOf[NumberFormatException]) opt {
+                    java.lang.Long.parseLong(srec_d.take(2), 16)
                 } match {
-                    case Some(length) => {
-                        val n2 = n1.drop(2)
-                        if((n2.length / 2) == length) {
+                    case Some(srec_d_l) => {
+                        val srec_b = srec_d.drop(2)
+                        if((srec_b.length / 2) == srec_d_l) {
                             executed_record_count += 1
-                            /* 8(4 octet * 2 character) is address skiped */
-                            for(b <- n2.slice(8, n2.length-2).grouped(2))
-                                outFunc(b)
-                        } else
-                            log_error(f"invalid length:expected=$length%d,actual=${n2.length}%d")
+                            /* Skip 8 characters(4 octets * 2 characters) because it is an address which is waste. */
+                            srec_b.slice(8, srec_b.length-2).grouped(2).map(produce(_)).toArray
+                        } else {
+                            throw new IllegalArgumentException(f"invalid length:expected=$srec_d_l%d,actual=${srec_b.length}%d")
+                        }
                     }
-                    case None => log_error(s"invalid length:${n1.take(2)}")
+                    case None => throw new IllegalArgumentException(s"invalid length format:${srec_d.take(2)}")
                 }
-                case r => log_error(s"invalid record start:$r")
+                case _ => throw new IllegalArgumentException(s"invalid record start:$srecStr")
             }
         }
+    }
+
+    @tailrec
+    def parseRecords[A:ClassTag](
+        srcs: Seq[String],
+        dsts: LFA[A],
+        produce: (String) => A): LFA[A]
+    = srcs match {
+        case Seq()               => dsts    /* finish to repeat function execution */
+        case Seq(h, t_recs @ _*) => parseRecords(t_recs, parseRecord(h,produce) :: dsts, produce)
+    }
+
+    def parseAndOut[A:ClassTag](
+        srcs: Seq[String],
+        produce: (String) => A,
+        outFunc: (Array[A]) => Unit): Unit
+    = {
+        val fs = parseRecords(srcs,List.empty[FA[A]],produce)
+        val fseq = Future.sequence(fs)
+        fseq.onComplete {
+            case Success(lb) => {
+                log_debug("lb:"+lb)
+                outFunc(lb.toArray.flatten)
+            }
+            case Failure(th) => log_error(th.getMessage)
+        }
+        Await.ready(fseq, Duration.Inf)
     }
 
     def loadData(file: File): Option[Seq[String]] = {
@@ -154,29 +195,29 @@ object Motorola_S_record2Data {
             case None => /* continue */
         }
 
-        val records = loadData(Args.inFile) match {
+        val srecords = loadData(Args.inFile) match {
             case Some(d) => d
             case None => sys.exit(2)
         }
-        log_info(f"${records.length}%d redords found")
+        log_info(f"${srecords.length}%d redords found")
 
-        val outStream = new BufferedOutputStream(new FileOutputStream(Args.outFile))
-
-        ultimately {
-            outStream.flush
-            outStream.close
-        } {
-            Args.mode match {
-                case Mode.Binary  => parseAndOut(records, (b) => outStream.write(Integer.parseInt(b,16)))
-                case Mode.Hexdump => {
-                    var cnt = 0
-                    parseAndOut(records, (b) => {
-                        outStream.write(b.getBytes)
-                        cnt += 1
-                        if((cnt % Args.column_size) == 0)
-                            outStream.write(f"%n".getBytes)
-                    })
-                }
+        Args.mode match {
+            case Mode.Binary => {
+                val outStream = new BufferedOutputStream(new FileOutputStream(Args.outFile))
+                parseAndOut[Byte](srecords,
+                                  (b) => Integer.parseInt(b,16).toByte,
+                                  (data) => using(outStream)(_.write(data)))
+            }
+            case Mode.Hexdump => {
+                val writer = new BufferedWriter(new FileWriter(Args.outFile))
+                var cnt = 0
+                parseAndOut[String](srecords, (s) => {
+                    cnt += 1
+                    if((cnt % Args.column_size) == 0)
+                        f"$s%n"
+                    else
+                        s
+                }, (data) => using(writer)(_.write(data.mkString)))
             }
         }
 
