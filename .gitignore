@@ -6,7 +6,11 @@
 *.lnk
 *.log
 target
+project
 
 out.bin
 out.txt
+
+Motorola_S_record2Data.sh
+Data2Motorola_S_record.sh
 
