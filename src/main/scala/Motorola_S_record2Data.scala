@@ -7,6 +7,7 @@ import java.io.FileWriter
 import java.io.IOException
 import java.io.OutputStream
 import java.io.Writer
+import java.util.concurrent.CountDownLatch
 
 import scala.annotation.tailrec
 import scala.concurrent._
@@ -28,8 +29,6 @@ object Motorola_S_record2Data {
     type LFA[A] = List[FA[A]]
     type LA[A] = List[Array[A]]
 
-    var executed_record_count = 0
-
     def parseRecord[A:ClassTag](srecStr: String, produce: (String) => A): FA[A] = {
         val srec_r = "^S3(.*)".r
         Future {
@@ -40,7 +39,6 @@ object Motorola_S_record2Data {
                     case Some(srec_d_l) => {
                         val srec_b = srec_d.drop(2)
                         if((srec_b.length / 2) == srec_d_l) {
-                            executed_record_count += 1
                             /* Skip 8 characters(4 octets * 2 characters) because it is an address which is waste. */
                             srec_b.slice(8, srec_b.length-2).grouped(2).map(produce(_)).toArray
                         } else {
@@ -61,24 +59,30 @@ object Motorola_S_record2Data {
         produce: (String) => A): LFA[A]
     = srcs match {
         case Seq()               => dsts    /* finish to repeat function execution */
-        case Seq(h, t_recs @ _*) => parseRecords(t_recs, parseRecord(h,produce) :: dsts, produce)
+        case Seq(h, t_recs @ _*) => parseRecords(t_recs, dsts :+ parseRecord(h,produce), produce)
     }
 
     def parseAndOut[A:ClassTag](
         srcs: Seq[String],
         produce: (String) => A,
-        outFunc: (Array[A]) => Unit): Unit
+        outFunc: (LA[A]) => Unit): Int
     = {
+        val countDownLatch = new CountDownLatch(1)
         val fs = parseRecords(srcs,List.empty[FA[A]],produce)
         val fseq = Future.sequence(fs)
         fseq.onComplete {
             case Success(lb) => {
-                log_debug("lb:"+lb)
-                outFunc(lb.toArray.flatten)
+                outFunc(lb)
+                countDownLatch.countDown
             }
-            case Failure(th) => log_error(th.getMessage)
+            case Failure(th) => {
+                log_error(th.getMessage)
+                countDownLatch.countDown
+            }
         }
         Await.ready(fseq, Duration.Inf)
+        countDownLatch.await
+        fs.size
     }
 
     def loadData(file: File): Option[Seq[String]] = {
@@ -201,27 +205,26 @@ object Motorola_S_record2Data {
         }
         log_info(f"${srecords.length}%d redords found")
 
-        Args.mode match {
+        val count = Args.mode match {
             case Mode.Binary => {
                 val outStream = new BufferedOutputStream(new FileOutputStream(Args.outFile))
-                parseAndOut[Byte](srecords,
-                                  (b) => Integer.parseInt(b,16).toByte,
-                                  (data) => using(outStream)(_.write(data)))
+                parseAndOut[Byte](
+                    srecords,
+                    (b) => Integer.parseInt(b,16).toByte,
+                    (la) => using(outStream)(w => la.foreach(w.write(_)))
+                )
             }
             case Mode.Hexdump => {
                 val writer = new BufferedWriter(new FileWriter(Args.outFile))
-                var cnt = 0
-                parseAndOut[String](srecords, (s) => {
-                    cnt += 1
-                    if((cnt % Args.column_size) == 0)
-                        f"$s%n"
-                    else
-                        s
-                }, (data) => using(writer)(_.write(data.mkString)))
+                parseAndOut[String](
+                    srecords,
+                    (s) => s,
+                    (la) => using(writer)(_.write(la.flatten.mkString.grouped(Args.column_size*2).mkString(f"%n")))
+                )
             }
         }
 
-        log_info(f"${executed_record_count}%d redords executed")
+        log_info(f"$count%d redords executed")
     }
 }
 
