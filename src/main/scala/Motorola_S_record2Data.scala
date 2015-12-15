@@ -1,15 +1,14 @@
-
 import java.io.BufferedOutputStream
 import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
 import java.io.FileWriter
 import java.io.IOException
-import java.io.OutputStream
-import java.io.Writer
 import java.util.concurrent.CountDownLatch
 
 import scala.annotation.tailrec
+import scala.collection.mutable.Buffer
+import scala.collection.mutable.ListBuffer
 import scala.concurrent._
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.duration.Duration
@@ -25,11 +24,7 @@ import org.hirosezouen.hzutil.HZIO._
 object Motorola_S_record2Data {
     implicit val logger = getLogger(this.getClass.getName)
 
-    type FA[A] = Future[Array[A]]
-    type LFA[A] = List[FA[A]]
-    type LA[A] = List[Array[A]]
-
-    def parseRecord[A:ClassTag](srecStr: String, produce: (String) => A): FA[A] = {
+    def parseRecord[A:ClassTag](srecStr: String, produce: (String) => A): Future[A] = {
         val srec_r = "^S3(.*)".r
         Future {
             srecStr match {
@@ -40,7 +35,7 @@ object Motorola_S_record2Data {
                         val srec_b = srec_d.drop(2)
                         if((srec_b.length / 2) == srec_d_l) {
                             /* Skip 8 characters(4 octets * 2 characters) because it is an address which is waste. */
-                            srec_b.slice(8, srec_b.length-2).grouped(2).map(produce(_)).toArray
+                            produce(srec_b.slice(8, srec_b.length-2))
                         } else {
                             throw new IllegalArgumentException(f"invalid length:expected=$srec_d_l%d,actual=${srec_b.length}%d")
                         }
@@ -55,24 +50,24 @@ object Motorola_S_record2Data {
     @tailrec
     def parseRecords[A:ClassTag](
         srcs: Seq[String],
-        dsts: LFA[A],
-        produce: (String) => A): LFA[A]
+        dsts: Buffer[Future[A]],
+        produce: (String) => A): Seq[Future[A]]
     = srcs match {
         case Seq()               => dsts    /* finish to repeat function execution */
-        case Seq(h, t_recs @ _*) => parseRecords(t_recs, dsts :+ parseRecord(h,produce), produce)
+        case Seq(h, t_recs @ _*) => parseRecords(t_recs, dsts += parseRecord(h,produce), produce)
     }
 
     def parseAndOut[A:ClassTag](
         srcs: Seq[String],
         produce: (String) => A,
-        outFunc: (LA[A]) => Unit): Int
+        outFunc: (Seq[A]) => Unit): Int
     = {
         val countDownLatch = new CountDownLatch(1)
-        val fs = parseRecords(srcs,List.empty[FA[A]],produce)
+        val fs = parseRecords(srcs,ListBuffer.empty[Future[A]],produce)
         val fseq = Future.sequence(fs)
         fseq.onComplete {
-            case Success(lb) => {
-                outFunc(lb)
+            case Success(la) => {
+                outFunc(la)
                 countDownLatch.countDown
             }
             case Failure(th) => {
@@ -117,7 +112,7 @@ object Motorola_S_record2Data {
                 |outFile     = $outFile""".stripMargin
     }
 
-    def initArgs(args: Array[String]): Option[String] = {
+    def setupArgs(args: Array[String]): Option[String] = {
         var ret: Option[String] = None
 
         val f = new File(args.last)
@@ -128,39 +123,36 @@ object Motorola_S_record2Data {
         val itr = args.init.iterator
         var loopFlag = 1
         while((itr.hasNext) && (loopFlag == 1)) {
-            def parseError(errMsg: String) = {ret = Some(errMsg) ; loopFlag = 0}
+            def parseError(errMsg: String) = {
+                ret = Some(errMsg)
+                loopFlag = 0
+            }
+            def parseParamArgs(p: String, itr2: Iterator[String], setToArgs: (String) => Unit) {
+                if(itr2.hasNext) {
+                    setToArgs(itr2.next)
+                } else
+                    parseError(s"$p required more argument")
+            }
             itr.next match {
-                case "-m" =>
-                    if(itr.hasNext) {
-                        val t = itr.next
-                        l_t(s"-m $t")
-                        t.toLowerCase match {
-                            case "binary" | "bin" | "b" => {
-                                Args.mode = Mode.Binary
-                                Args.outFile = new File("out.bin")
-                            }
-                            case "hexdump" | "hex" | "h" => {
-                                Args.mode = Mode.Hexdump
-                                Args.outFile = new File("out.txt")
-                            }
-                            case _ => parseError(s"unknown -m argument : $t")
-                        }
-                    } else
-                        parseError("-m required more argument")
-                case "-c" =>
-                    if(itr.hasNext) {
-                        val cs = itr.next
-                        l_t(s"-c $cs")
+                case "-m" => parseParamArgs("-m", itr, (mode) => mode.toLowerCase match {
+                    case "binary" | "bin" | "b" => {
+                        Args.mode = Mode.Binary
+                        Args.outFile = new File("out.bin")
+                    }
+                    case "hexdump" | "hex" | "h" => {
+                        Args.mode = Mode.Hexdump
+                        Args.outFile = new File("out.txt")
+                    }
+                    case _ => parseError(s"unknown -m argument : $mode")
+                })
+                case "-c" => parseParamArgs("-c", itr,
+                    (cs) => catching(classOf[NumberFormatException]) opt {
                         Args.column_size = Integer.parseInt(cs)
-                    } else
-                        parseError("-c required more argument")
-                case "-o" =>
-                    if(itr.hasNext) {
-                        val of = itr.next
-                        l_t(s"-o $of")
-                        Args.outFile = new File(of)
-                    } else
-                        parseError("-o required more argument")
+                    } match {
+                        case Some(_) => /* OK */
+                        case None    => parseError(s"malformed -c argument : $cs")
+                    })
+                case "-o" => parseParamArgs("-o", itr, (of) => Args.outFile = new File(of))
                 case s => parseError(s"unknown parameter : $s")
             }
         }
@@ -190,7 +182,7 @@ object Motorola_S_record2Data {
             sys.exit(1)
         }
 
-        initArgs(args) match {
+        setupArgs(args) match {
             case Some(errMsg) => {
                 log_error(errMsg)
                 printUsage
@@ -208,18 +200,18 @@ object Motorola_S_record2Data {
         val count = Args.mode match {
             case Mode.Binary => {
                 val outStream = new BufferedOutputStream(new FileOutputStream(Args.outFile))
-                parseAndOut[Byte](
+                parseAndOut[Array[Byte]](
                     srecords,
-                    (b) => Integer.parseInt(b,16).toByte,
-                    (la) => using(outStream)(w => la.foreach(w.write(_)))
+                    (data) => data.grouped(2).map(Integer.parseInt(_,16).toByte).toArray,
+                    (lab) => using(outStream)(w => lab.foreach(w.write(_)))
                 )
             }
             case Mode.Hexdump => {
                 val writer = new BufferedWriter(new FileWriter(Args.outFile))
                 parseAndOut[String](
                     srecords,
-                    (s) => s,
-                    (la) => using(writer)(_.write(la.flatten.mkString.grouped(Args.column_size*2).mkString(f"%n")))
+                    (data) => data,
+                    (ls) => using(writer)(_.write(ls.mkString.grouped(Args.column_size*2).mkString(f"%n")))
                 )
             }
         }
