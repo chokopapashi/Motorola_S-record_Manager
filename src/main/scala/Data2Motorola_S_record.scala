@@ -3,9 +3,18 @@ import java.io.FileInputStream
 import java.io.FileWriter
 import java.io.IOException
 import java.io.Writer
+import java.util.concurrent.CountDownLatch
 
+import scala.annotation.tailrec
+import scala.collection.mutable.Buffer
+import scala.collection.mutable.ListBuffer
+import scala.concurrent._
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration.Duration
 import scala.io.Source
 import scala.util.control.Exception._
+import scala.util.Success
+import scala.util.Failure
 
 import org.hirosezouen.hzutil._
 import HZLog._
@@ -14,6 +23,7 @@ import HZIO._
 object Data2Motorola_S_record {
     implicit val logger = getLogger(this.getClass.getName)
 
+    /* 古いチェックサム計算 */
 //    def checkSum(s: Short, d: Short): Short = {
 //        var r = d + s
 //        if(0xFF < r)    /* overflow */
@@ -34,76 +44,84 @@ object Data2Motorola_S_record {
         r.toShort
     }
 
-    def execute_S_Format(seq: IndexedSeq[Byte], baseAddress: Long, writer: Writer) = {
-
-        val recStr = new  StringBuilder()
-
-        var addr = baseAddress
-        var loopFlag = true
-        val itr = seq.grouped(16)
-        while(itr.hasNext && loopFlag) {
-            val bytes = itr.next
-//            l_t("%s".format(arrayToString(bytes.toArray[Byte])))
-            recStr.clear
-            recStr ++= "S3"
-            recStr ++= "15" /* 15h(21) addr(4) + data(16) + sum(1) */
-            recStr ++= "%08X".format(addr)
+    def build_S_record(bytes: Array[Byte], addr: Long): Future[String] = {
+        Future {
+            val srec = StringBuilder.newBuilder
+            srec ++= "S3"
+            srec ++= "15" /* 15h(21) addr(4) + data(16) + sum(1) */
+            srec ++= "%08X".format(addr)
 
             var sum: Short = 0x15
             sum = checkSum(((addr >> 24) & 0x00FF).toShort, sum)
             sum = checkSum(((addr >> 16) & 0x00FF).toShort, sum)
             sum = checkSum(((addr >> 8)  & 0x00FF).toShort, sum)
             sum = checkSum((addr & 0x00FF).toShort, sum)
-
-            for(byte <- bytes) {
-                recStr ++= "%02X".format(byte)
-                sum = checkSum((byte & 0x0ff).toShort, sum)
+            sum = bytes.foldLeft(sum){ (z,b) =>
+                srec ++= "%02X".format(b)
+                checkSum((b & 0x0ff).toShort, z)
             }
+            srec ++= f"${~sum & 0x00ff}%02X"
 
-            recStr ++= f"${~sum & 0x00ff}%02X"
-            recStr ++= f"%n"
-            catching(classOf[IOException]) either writer.write(recStr.mkString) match {
-                case Right(_) => /* OK, continue */
-                case Left(th: Throwable) => {
-                    log_error(th)
-                    loopFlag = false
-                }
-            }
-
-            addr += 16
+            srec.mkString
         }
     }
 
-    def loadBinaryData(file: File): Option[IndexedSeq[Byte]] = {
-        val buff = new Array[Byte](file.length.toInt)
-        var inStream = new FileInputStream(file)
-        catching(classOf[IOException]) andFinally {
-            inStream.close
-        } either {
-            inStream = new FileInputStream(file)
-            inStream.read(buff)
+    @tailrec
+    def build_S_records(
+        srcs: List[Array[Byte]],
+        dsts: Buffer[Future[String]],
+        addr: Long): Seq[Future[String]]
+    = srcs match {
+        case Nil         => dsts    /* finish to repeat function execution */
+        case h :: t_srcs => build_S_records(t_srcs, dsts += build_S_record(h,addr), addr+16)
+    }
+
+    def parseAndOut(
+        srcs: Array[Byte],
+        baseAddress: Long,
+        outFunc: (Seq[String]) => Unit): Int
+    = {
+        val countDownLatch = new CountDownLatch(1)
+        val fs = build_S_records(srcs.grouped(16).toList, ListBuffer.empty[Future[String]], baseAddress)
+        val fseq = Future.sequence(fs)
+        fseq.onComplete {
+            case Success(ls) => {
+                outFunc(ls)
+                countDownLatch.countDown
+            }
+            case Failure(th) => {
+                log_error(th.getMessage)
+                countDownLatch.countDown
+            }
+        }
+        Await.ready(fseq, Duration.Inf)
+        countDownLatch.await
+        fs.size
+    }
+
+    def loadBinaryData(file: File): Option[Array[Byte]] = {
+        catching(classOf[IOException]) either {
+            using(new FileInputStream(file)){ in =>
+                val buff = new Array[Byte](file.length.toInt)
+                in.read(buff)
+                buff
+            }
         } match {
-            case Right(_) => Some(buff)
-            case Left(th: Throwable) => {
-                log_error(th)
-                None
-            }
+            case Right(ab) => Some(ab)
+            case Left(th: Throwable) => {log_error(th) ; None}
         }
     }
 
-    def loadHexdecimalTextData(file: File): Option[IndexedSeq[Byte]] = {
-        val buff = new Array[Byte](file.length.toInt)
+    def loadHexdecimalTextData(file: File): Option[Array[Byte]] = {
         catching(classOf[IOException]) either {
             val hexStr = using(Source.fromFile(file))(_.getLines.mkString)
             if((hexStr.length & 0x00000001) != 0)
                 throw new IllegalArgumentException("malformed hexadecimal text (total length is odd number).")
-            hexStr.grouped(2).map(java.lang.Byte.parseByte(_,16))
+            hexStr.grouped(2).map(Integer.parseInt(_,16).toByte).toArray
         } match {
-            case Right(_) => Some(buff)
-            case Left(th: Throwable) => {
-                log_error(th)
-                None
-            }
+            case Right(ab) => Some(ab)
+            case Left(th:IllegalArgumentException) => {log_error(th.getMessage) ; None}
+            case Left(th: Throwable) => {log_error(th) ; None}
         }
     }
 
@@ -127,7 +145,7 @@ object Data2Motorola_S_record {
                 |outFile      = $outFile%s""".stripMargin
     }
 
-    def initArgs(args: Array[String]): Option[String] = {
+    def setupArgs(args: Array[String]): Option[String] = {
         var ret: Option[String] = None
 
         val f = new File(args.last)
@@ -138,38 +156,29 @@ object Data2Motorola_S_record {
         val itr = args.init.iterator
         var loopFlag = 1
         while((itr.hasNext) && (loopFlag == 1)) {
-            def parseError(errMsg: String) = ret = Some(errMsg) ; loopFlag = 0
+            def parseError(errMsg: String) = {
+                ret = Some(errMsg)
+                loopFlag = 0
+            }
+            def parseParamArgs(p: String, itr2: Iterator[String], setToArgs: (String) => Unit) {
+                if(itr2.hasNext)
+                    setToArgs(itr2.next)
+                else
+                    parseError(s"$p required more argument")
+            }
             itr.next match {
-                case "-m" =>
-                    if(itr.hasNext) {
-                        val t = itr.next
-                        l_t(s"-m $t")
-                        t.toLowerCase match {
-                            case "binary" | "bin" | "b" => {
-                                Args.mode = Mode.Binary
-                            }
-                            case "hexadecimal" | "hex" | "h" => {
-                                Args.mode = Mode.Hexadecimal
-                            }
-                            case _ => parseError(s"unknown -m argument : $t")
-                        }
-                    } else
-                        parseError("-m required more argument")
-                case "-a" => if(itr.hasNext) {
-                    val addr = itr.next
-                    l_t("-a %s".format(addr))
-                    catching(classOf[NumberFormatException]) opt java.lang.Long.parseLong(addr,16) match {
+                case "-m" => parseParamArgs("-m", itr, (mode) =>
+                    mode.toLowerCase match {
+                        case "binary" | "bin" | "b" => Args.mode = Mode.Binary
+                        case "hexadecimal" | "hex" | "h" => Args.mode = Mode.Hexadecimal
+                        case _ => parseError(s"unknown -m argument : $mode")
+                    })
+                case "-a" => parseParamArgs("-a", itr, (as) =>
+                    catching(classOf[NumberFormatException]) opt java.lang.Long.parseLong(as,16) match {
                         case Some(x) => Args.startAddress = x
-                        case None => parseError("%s is invalid Address".format(addr))
-                    }
-                } else
-                    parseError("-a required more option")
-                case "-o" => if(itr.hasNext) {
-                    val of = itr.next
-                    l_t("-o %s".format(of))
-                    Args.outFile = new File(of)
-                } else
-                    parseError("-o required more option")
+                        case None => parseError("%s is invalid Address".format(as))
+                    })
+                case "-o" => parseParamArgs("-o", itr, (of) => Args.outFile = new File(of))
                 case s => parseError("unknown optioin : %s".format(s))
             }
         }
@@ -198,7 +207,7 @@ object Data2Motorola_S_record {
             sys.exit(1)
         }
 
-        initArgs(args) match {
+        setupArgs(args) match {
             case Some(errMsg) => {
                 println("error : %s.".format(errMsg))
                 sys.exit(2)
@@ -217,13 +226,10 @@ object Data2Motorola_S_record {
             }
         }
             
-        val witer = new FileWriter(Args.outFile)
-        ultimately {
-            witer.flush
-            witer.close
-        } {
-            execute_S_Format(data, Args.startAddress, witer)
-        }
+        parseAndOut(data,
+                    Args.startAddress,
+                    (ls) => using(new FileWriter(Args.outFile))(_.write(ls.mkString(f"%n")))
+        )
     }
 }
 
