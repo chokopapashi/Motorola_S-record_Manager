@@ -1,5 +1,3 @@
-import java.io.BufferedOutputStream
-import java.io.BufferedWriter
 import java.io.File
 import java.io.FileOutputStream
 import java.io.FileWriter
@@ -128,25 +126,26 @@ object Motorola_S_record2Data {
                 loopFlag = 0
             }
             def parseParamArgs(p: String, itr2: Iterator[String], setToArgs: (String) => Unit) {
-                if(itr2.hasNext) {
+                if(itr2.hasNext)
                     setToArgs(itr2.next)
-                } else
+                else
                     parseError(s"$p required more argument")
             }
             itr.next match {
-                case "-m" => parseParamArgs("-m", itr, (mode) => mode.toLowerCase match {
-                    case "binary" | "bin" | "b" => {
-                        Args.mode = Mode.Binary
-                        Args.outFile = new File("out.bin")
-                    }
-                    case "hexdump" | "hex" | "h" => {
-                        Args.mode = Mode.Hexdump
-                        Args.outFile = new File("out.txt")
-                    }
-                    case _ => parseError(s"unknown -m argument : $mode")
-                })
-                case "-c" => parseParamArgs("-c", itr,
-                    (cs) => catching(classOf[NumberFormatException]) opt {
+                case "-m" => parseParamArgs("-m", itr, (mode) =>
+                    mode.toLowerCase match {
+                        case "binary" | "bin" | "b" => {
+                            Args.mode = Mode.Binary
+                            Args.outFile = new File("out.bin")
+                        }
+                        case "hexdump" | "hex" | "h" => {
+                            Args.mode = Mode.Hexdump
+                            Args.outFile = new File("out.txt")
+                        }
+                        case _ => parseError(s"unknown -m argument : $mode")
+                    })
+                case "-c" => parseParamArgs("-c", itr, (cs) =>
+                    catching(classOf[NumberFormatException]) opt {
                         Args.column_size = Integer.parseInt(cs)
                     } match {
                         case Some(_) => /* OK */
@@ -199,19 +198,17 @@ object Motorola_S_record2Data {
 
         val count = Args.mode match {
             case Mode.Binary => {
-                val outStream = new BufferedOutputStream(new FileOutputStream(Args.outFile))
                 parseAndOut[Array[Byte]](
                     srecords,
                     (data) => data.grouped(2).map(Integer.parseInt(_,16).toByte).toArray,
-                    (lab) => using(outStream)(w => lab.foreach(w.write(_)))
+                    (lab) => using(new FileOutputStream(Args.outFile))(w => lab.foreach(w.write(_)))
                 )
             }
             case Mode.Hexdump => {
-                val writer = new BufferedWriter(new FileWriter(Args.outFile))
                 parseAndOut[String](
                     srecords,
                     (data) => data,
-                    (ls) => using(writer)(_.write(ls.mkString.grouped(Args.column_size*2).mkString(f"%n")))
+                    (ls) => using(new FileWriter(Args.outFile))(_.write(ls.mkString.grouped(Args.column_size*2).mkString(f"%n")))
                 )
             }
         }
